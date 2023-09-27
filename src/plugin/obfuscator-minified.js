@@ -2,6 +2,7 @@
  * 整合自下面两个项目：
  * * cilame/v_jstools
  * * Cqxstevexw/decodeObfuscator
+ * minified 适用于先对多个文件单独进行 obfuscator，然后再将 obfuscated 的文件进行 minify 然后 bundle 的情况
  */
 const { parse } = require('@babel/parser')
 const generator = require('@babel/generator').default
@@ -53,6 +54,8 @@ function decodeObject(ast) {
   })
   let obj_used = {}
   function replaceObject(path) {
+    // 排除 obj[propKey] 的情况
+    if (path.node.computed) return
     const name = path.node.object
     const key = path.node.property
     if (!t.isIdentifier(name) || !t.isIdentifier(key)) {
@@ -91,6 +94,50 @@ function decodeObject(ast) {
 }
 
 function decodeGlobal(ast) {
+  // 因为代码混淆后又进行了minify，所以要预处理一下
+  traverse(ast, {
+    // return (a = b)() -> a = b; return a
+    // 不然 find_ob_sort_list_by_feature 找不到 string list func ("func1")
+    ReturnStatement(path) {
+      if (
+        t.isCallExpression(path.node.argument) &&
+        t.isAssignmentExpression(path.node.argument.callee)
+      ) {
+        // 这里需要套一层expressionStatement，不然 generator(path.node, { minified: true }) 的 minified 之后分号;会缺失导致报错
+        path.insertBefore(t.expressionStatement(path.node.argument.callee))
+        path
+          .get('argument')
+          .get('callee')
+          .replaceWith(path.node.argument.callee.left)
+        path.scope.crawl()
+      }
+    },
+    // (a = b)() -> a = b, a()
+    // (a = b)['prop'] = value -> a = b, a['prop'] = value;
+    // 不然 do_parse_value 识别不到函数调用
+    AssignmentExpression(path) {
+      if (path.parentPath.isExpression() && typeof path.key === 'string') {
+        if (
+          path.parentPath.isMemberExpression() &&
+          (path.parentPath.parentPath.isAssignmentExpression() ||
+            path.parentPath.parentPath.isCallExpression())
+        ) {
+          let sequence = t.sequenceExpression([
+            path.node,
+            path.parentPath.parentPath.node,
+          ])
+          path.replaceWith(path.node.left)
+          path.parentPath.parentPath.replaceWith(sequence)
+        } else if (path.parentPath.isCallExpression()) {
+          let sequence = t.sequenceExpression([path.node, path.parentPath.node])
+          path.replaceWith(path.node.left)
+          path.parentPath.replaceWith(sequence)
+        }
+        path.scope.crawl()
+      }
+    },
+  })
+
   // 找到关键的函数
   let ob_func_str = []
   let ob_dec_name = []
@@ -229,14 +276,34 @@ function decodeGlobal(ast) {
     let nodes = []
     // The sorting function maybe missing in some config
     function find2(refer_path) {
+      let functionParent = refer_path.parentPath.getFunctionParent()
       if (
         refer_path.parentPath.isCallExpression() &&
         refer_path.listKey === 'arguments' &&
         refer_path.key === 0
       ) {
-        let rm_path = refer_path.parentPath
+        let rm_path = functionParent
         if (rm_path.parentPath.isExpressionStatement()) {
           rm_path = rm_path.parentPath
+        }
+        nodes.push([rm_path.node, 'func2'])
+        rm_path.remove()
+      } else if (
+        // minified 之后的 sorting function func2 可能变成这种形式 (function(t, e){...})()
+        // 这时 array func 不是通过参数传进去的而是直接调用的，因此此时 refer_path 不处于 arguments 中
+        refer_path.parentPath.isCallExpression() &&
+        functionParent?.node.params.length === 2 &&
+        functionParent.parentPath?.node.arguments?.length === 0 &&
+        functionParent.node.id === null
+      ) {
+        let rm_path = functionParent
+        // 对应 functionParent 是(function(){})()自执行的情况
+        if (rm_path.parentPath.isCallExpression()) {
+          rm_path = rm_path.parentPath
+          // 对应 functionParent 是!function(){}()自执行的情况
+          if (rm_path.parentPath.isUnaryExpression()) {
+            rm_path = rm_path.parentPath
+          }
         }
         nodes.push([rm_path.node, 'func2'])
         rm_path.remove()
@@ -282,17 +349,24 @@ function decodeGlobal(ast) {
   }
   traverse(ast, { FunctionDeclaration: find_ob_sort_list_by_feature })
   if (!ob_string_func_name) {
-    console.warn('Try fallback mode...')
-    traverse(ast, { ExpressionStatement: find_ob_sort_func })
-    if (!ob_string_func_name) {
-      console.error('Cannot find string list!')
       return false
-    }
-    traverse(ast, { Identifier: find_ob_sort_list_by_name })
-    if (ob_func_str.length < 3 || !ob_dec_name.length) {
-      console.error('Essential code missing!')
-      return false
-    }
+    // 这个 callback 会在 find_ob_sort_func 里误删代码，先屏蔽了
+    // console.warn('Try fallback mode...')
+    // try {
+    //   traverse(ast, { ExpressionStatement: find_ob_sort_func })
+    //   if (!ob_string_func_name) {
+    //     console.error('Cannot find string list!')
+    //     return false
+    //   }
+    //   traverse(ast, { Identifier: find_ob_sort_list_by_name })
+    //   if (ob_func_str.length < 3 || !ob_dec_name.length) {
+    //     console.error('Essential code missing!')
+    //     return false
+    //   }
+    // } catch (error) {
+    //   console.warn('Fallback failed!', error)
+    //   return false
+    // }
   }
   console.log(`String List Name: ${ob_string_func_name}`)
   try {
@@ -595,16 +669,30 @@ function unpackCall(path) {
   // var dd = "eee";
   // var ee = A[x][y][...];
   let node = path.node
+  // 某些情况下不一定有var，而是直接 _0xb28de8 = {...}
+  let objName
+  let objExp
+  if (path.isVariableDeclarator()) {
+    objName = node.id.name
+    objExp = node.init
+  } else if (path.isAssignmentExpression()) {
+    if (!t.isIdentifier(node.left)) {
+      return
+    }
+    objName = node.left.name
+    objExp = node.right
+  } else {
+    throw new Error('Unexpected node type')
+  }
   // 变量必须定义为Object类型才可能是代码块加密内容
-  if (!t.isObjectExpression(node.init)) {
+  if (!t.isObjectExpression(objExp)) {
     return
   }
-  let objPropertiesList = node.init.properties
-  if (objPropertiesList.length == 0) {
+  let objPropertiesList = objExp.properties
+  if (objPropertiesList.length === 0) {
     return
   }
   // 遍历Object 判断每个元素是否符合格式
-  let objName = node.id.name
   let objKeys = {}
   // 有时会有重复的定义
   let replCount = 0
@@ -612,7 +700,8 @@ function unpackCall(path) {
     if (!t.isObjectProperty(prop)) {
       return
     }
-    let key = prop.key.value
+    // 可能是 "dawd": "" 或者 dawd: ""
+    let key = t.isStringLiteral(prop.key) ? prop.key.value : prop.key.name
     if (t.isFunctionExpression(prop.value)) {
       // 符合要求的函数必须有且仅有一条return语句
       if (prop.value.body.body.length !== 1) {
@@ -764,7 +853,10 @@ function decodeCodeBlock(ast) {
   // 先合并分离的Object定义
   traverse(ast, { VariableDeclarator: { exit: mergeObject } })
   // 在变量定义完成后判断是否为代码块加密内容
-  traverse(ast, { VariableDeclarator: { exit: unpackCall } })
+  traverse(ast, {
+    VariableDeclarator: { exit: unpackCall },
+    AssignmentExpression: { exit: unpackCall },
+  })
   // 合并字面量(在解除区域混淆后会出现新的可合并分割)
   traverse(ast, { BinaryExpression: { exit: calcBinary } })
   return ast
@@ -1005,6 +1097,16 @@ function splitSequence(path) {
       body.push(t.ExpressionStatement(express))
     })
     path.replaceInline(body)
+  } else if (
+    // (a = b, b)() -> a = b; b();
+    parentPath.isCallExpression() &&
+    path.key === 'callee' &&
+    parentPath.parentPath.isExpressionStatement()
+  ) {
+    parentPath.parentPath.insertBefore(
+      expressions.slice(0, -1).map((item) => t.expressionStatement(item))
+    )
+    path.replaceInline(expressions.at(-1))
   } else {
     return
   }
@@ -1245,14 +1347,52 @@ module.exports = function (jscode) {
       delete node.extra
     },
   })
-  console.log('还原数值...')
-  if (!decodeObject(ast)) {
-    return null
+  /**
+   * make identifier name unique
+   * minified 之后加密函数名都是一个字母，导致在 decodeGlobal 的 do_parse_value 中会报错
+   */
+  function makeIdentifierUnique(ast) {
+    function* generateName() {
+      let index = 0
+      while (true) {
+        yield `_${index++}`
+      }
+    }
+    let nameGenerator = generateName()
+    traverse(ast, {
+      'VariableDeclarator|FunctionDeclaration'(path) {
+        if (path.node.id === null) return
+        let name = path.node.id.name
+        while (true) {
+          let newName = name + nameGenerator.next().value
+          if (!path.scope.hasBinding(newName)) {
+            path.scope.rename(name, newName)
+            break
+          }
+        }
+      },
+    })
   }
+  makeIdentifierUnique(ast)
+  // console.log('还原数值...')
+  // if (!decodeObject(ast)) {
+  //   return null
+  // }
   console.log('处理全局加密...')
+  // 多个单独混淆后的代码bundle在了一起，所以需要decodeGlobal多次
+  while (true) {
   if (!decodeGlobal(ast)) {
-    return null
+      break
+    }
   }
+  // 刷新代码，将("string") -> "string"
+  ast = parse(
+    generator(ast, {
+      comments: false,
+      jsescOption: { minimal: true },
+    }).code,
+    { errorRecovery: true }
+  )
   console.log('提高代码可读性...')
   ast = purifyCode(ast)
   console.log('处理代码块加密...')
