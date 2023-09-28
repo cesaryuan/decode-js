@@ -2,6 +2,7 @@
 const PluginSojson = require('./plugin/sojson.js')
 const PluginSojsonV7 = require('./plugin/sojsonv7.js')
 const PluginObfuscator = require('./plugin/obfuscator.js')
+const PluginObfuscatorMinified = require('./plugin/obfuscator-minified.js')
 const PluginAwsc = require('./plugin/awsc.js')
 
 // 读取参数
@@ -34,6 +35,8 @@ if (type === 'sojson') {
   code = PluginSojsonV7(sourceCode)
 } else if (type === 'obfuscator') {
   code = PluginObfuscator(sourceCode)
+} else if (type === 'obfuscator-minified') {
+  code = PluginObfuscatorBundledMinified(sourceCode)
 } else if (type === 'awsc') {
   code = PluginAwsc(sourceCode)
 }

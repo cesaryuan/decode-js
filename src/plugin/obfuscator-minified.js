@@ -10,7 +10,7 @@ const traverse = require('@babel/traverse').default
 const t = require('@babel/types')
 const vm = require('vm')
 const { VM } = require('vm2')
-
+const astOperations = require('../ast_operations.js')
 let globalContext = vm.createContext()
 let vm2 = new VM({
   allowAsync: false,
@@ -349,7 +349,7 @@ function decodeGlobal(ast) {
   }
   traverse(ast, { FunctionDeclaration: find_ob_sort_list_by_feature })
   if (!ob_string_func_name) {
-      return false
+    return false
     // 这个 callback 会在 find_ob_sort_func 里误删代码，先屏蔽了
     // console.warn('Try fallback mode...')
     // try {
@@ -1325,8 +1325,42 @@ const deleteObfuscatorCode = {
 }
 
 function unlockEnv(ast) {
+  // 删除如下代码
+  // !function () {
+  //   _0x3c4064_891(this, function () {
+  //     const r_930 = new RegExp("function *\\( *\\)"),
+  //           o_931 = new RegExp("\\+\\+ *(?:[a-zA-Z_$][0-9a-zA-Z_$]*)", "i"),
+  //           s_932 = _0x3c90fb_922("init");
+
+  //     r_930.test(s_932 + "chain") && o_931.test(s_932 + "input") ? _0x3c90fb_922() : s_932("0");
+  //   })();
+  // }();
+  const esquery = require('esquery')
+  const literalNodes = esquery(
+    ast,
+    `CallExpression[arguments.length=0] > ` +
+      `FunctionExpression[params.length=0][id=null] > BlockStatement CallExpression[arguments.length=2] > ` +
+      `ThisExpression ~ FunctionExpression NewExpression[callee.type='Identifier'][callee.name='RegExp'] > ` +
+      `StringLiteral[value='\\\\+\\\\+ *(?:[a-zA-Z_$][0-9a-zA-Z_$]*)']`
+  )
+  const literals = astOperations.ASTRelations.getNodePathsFromNodes(
+    ast,
+    literalNodes
+  )
+  for (const literal of literals) {
+    let functionExpression = astOperations.ASTRelations.getParentNodeOfType(
+      literal,
+      'FunctionExpression'
+    )
+    let expressionStatement = astOperations.ASTRelations.getParentNodeOfType(
+      functionExpression,
+      'ExpressionStatement'
+    )
+    expressionStatement.remove()
+  }
+
   //可能会误删一些代码，可屏蔽
-  traverse(ast, deleteObfuscatorCode)
+  // traverse(ast, deleteObfuscatorCode)
   return ast
 }
 
@@ -1381,7 +1415,7 @@ module.exports = function (jscode) {
   console.log('处理全局加密...')
   // 多个单独混淆后的代码bundle在了一起，所以需要decodeGlobal多次
   while (true) {
-  if (!decodeGlobal(ast)) {
+    if (!decodeGlobal(ast)) {
       break
     }
   }
@@ -1402,18 +1436,18 @@ module.exports = function (jscode) {
   // 刷新代码
   ast = parse(
     generator(ast, {
-      comments: false,
+      comments: true, // 保留一些可能已有的注释
       jsescOption: { minimal: true },
     }).code,
     { errorRecovery: true }
   )
   console.log('提高代码可读性...')
   ast = purifyCode(ast)
-  // console.log('解除环境限制...')
-  // ast = unlockEnv(ast)
+  console.log('解除环境限制...')
+  ast = unlockEnv(ast)
   console.log('净化完成')
   let { code } = generator(ast, {
-    comments: false,
+    comments: true, // 保留一些可能已有的注释
     jsescOption: { minimal: true },
   })
   return code
